@@ -29,7 +29,13 @@
     background:rgba(2,4,2,.88);}
   .hidden{display:none!important;}
   .panel{border:1px solid var(--hud-faint);padding:28px 34px;max-width:760px;width:min(94vw,760px);
-    position:relative;background:rgba(4,8,4,.6); max-height:92vh; overflow-y:auto;}
+    position:relative;background:rgba(4,8,4,.6); max-height:92vh; overflow-y:auto; overflow-x:hidden;
+    scrollbar-width:thin; scrollbar-color:var(--hud-faint) transparent;}
+  /* Safari has no scrollbar-color; browsers that do support it ignore these */
+  .panel::-webkit-scrollbar{width:8px;}
+  .panel::-webkit-scrollbar-track{background:transparent;}
+  .panel::-webkit-scrollbar-thumb{background:var(--hud-faint);}
+  .panel::-webkit-scrollbar-thumb:hover{background:var(--hud-dim);}
   .panel::before,.panel::after{content:'';position:absolute;width:14px;height:14px;}
   .panel::before{top:-1px;left:-1px;border-top:2px solid var(--hud);border-left:2px solid var(--hud);}
   .panel::after{bottom:-1px;right:-1px;border-bottom:2px solid var(--hud);border-right:2px solid var(--hud);}
@@ -743,7 +749,7 @@ const Game = {
   enemies:[], proj:[], hostiles:[], pickups:[], parts:[], beams:[], rings:[], trail:[], hazards:[],
   wells:[], wrecks:[],
   cam:{x:0,y:0,zoom:1, ez:1, tzoom:1, shake:0, drift:0, jx:0, jy:0},
-  player:null, spawnT:0, eliteT:25, bossSpawned:false, glitch:0, flashW:0, banner:null, bannerT:0,
+  player:null, spawnT:0, easeT:0, eliteT:25, bossSpawned:false, glitch:0, flashW:0, banner:null, bannerT:0,
   lowHullT:0, dmgDealt:0, craftKey:'ticTac', qCd:0, eCd:0,
   msnI:-1, msn:null, msnDelay:0, frags:[], zone:null, extract:null, won:false, endless:false, _lowComm:false,
 
@@ -779,7 +785,7 @@ const Game = {
     document.getElementById('win').classList.add('hidden');
     if(dctx) dctx.clearRect(0,0,decals.width,decals.height);
     this.cam.x=this.player.x; this.cam.y=this.player.y; this.cam.zoom=1.5; this.cam.tzoom=1;
-    this.spawnT=.5; this.eliteT=28; this.glitch=0; this.state='play';
+    this.spawnT=1.8; this.easeT=0; this.eliteT=28; this.glitch=0; this.state='play';
     document.body.classList.add('playing');
     if(ck){
       // resume at the era you fell in, with the build you entered it with
@@ -858,12 +864,18 @@ const Game = {
     // boss is spawned by TASKING 7 (THE HUNTER), not by the clock
     this.spawnT-=dt;
     if(this.spawnT<=0 && this.enemies.length<CFG.MAX_ENEMIES){
-      let iv=Math.max(.16, 1.05/m.spawn);
+      // session warm-up: every (re)entry to the feed ramps pressure in over ~40s,
+      // so fresh starts get room to learn and checkpoint resumes don't rebuild the swarm instantly
+      const ease=clamp(this.easeT/40, .35, 1);
+      let iv=Math.max(.16, 1.05/(m.spawn*ease));
       if(this.msn && (this.msn.def.type==='zone'||this.msn.def.type==='survive'||this.msn.def.type==='reach')) iv*=.7;
       this.spawnT = iv;
       const er=this.eraI||0;
       const inEra=k=>{ const E=ETYPES[k].era; return !E || (er>=E[0] && er<=E[1]); };
       let pool=Object.keys(ETYPES).filter(k=>ETYPES[k].phase<=m.idx && inEra(k));
+      // opening pressure is pursuit, not artillery: emplacements and ranged ground
+      // squads sit out the first wave (they can fire ~.5s after spawning at the ring)
+      if(this.easeT<20) pool=pool.filter(k=>{const t=ETYPES[k]; return !t.static && !(t.ground&&t.shooter);});
       // unit caps (SAM sites, gunship)
       pool=pool.filter(k=>{ const c=ETYPES[k].cap; if(!c)return true;
         let n=0; for(const e of this.enemies) if(e.type===k)n++; return n<c; });
@@ -998,7 +1010,7 @@ const Game = {
   // ---------- update ----------
   update(dt){
     const p=this.player, m=this.phaseMods();
-    this.time+=dt; if(this.bannerT>0)this.bannerT-=dt;
+    this.time+=dt; this.easeT+=dt; if(this.bannerT>0)this.bannerT-=dt;
     this.glitch=Math.max(0,this.glitch-dt*3); this.flashW=Math.max(0,this.flashW-dt*4);
     this.missionUpdate(dt);
 
@@ -1407,7 +1419,7 @@ const Game = {
     while(choices.length<3 && pool.length){ const i=randi(0,pool.length-1); choices.push(pool.splice(i,1)[0]); }
     const grid=document.getElementById('upgGrid'); grid.innerHTML='';
     if(!choices.length){ // everything maxed: heal instead
-      p.hp=Math.min(p.maxHp,p.hp+40); this.state='play'; return; }
+      p.hp=Math.min(p.maxHp,p.hp+40); p.inv=Math.max(p.inv,1.5); this.state='play'; return; }
     for(const c of choices){
       const btn=document.createElement('button'); btn.className='upg'+(c.isNew?' new':'');
       let name,desc,lab;
@@ -1417,7 +1429,9 @@ const Game = {
         name=P.name; desc=P.desc; lab=c.isNew?'NEW SYSTEM':'×'+cur+' → ×'+(cur+1); }
       btn.innerHTML=`<span><span class="un">${name}</span><div class="ud">${desc}</div></span><span class="ul">${lab}</span>`;
       btn.onclick=()=>{ this.applyUpgrade(c);
-        document.getElementById('lvlup').classList.add('hidden'); this.state='play'; this.cam.tzoom=1; };
+        document.getElementById('lvlup').classList.add('hidden');
+        p.inv=Math.max(p.inv,1.5); // reconfiguring: enemies converged while the tape was frozen
+        this.state='play'; this.cam.tzoom=1; };
       grid.appendChild(btn);
     }
     document.getElementById('lvlup').classList.remove('hidden');
@@ -1878,9 +1892,14 @@ function render(dtNow){
     x.beginPath(); x.arc(r.x,r.y,r.r,0,TAU); x.stroke();
     x.strokeStyle='rgba(245,248,240,.25)'; x.lineWidth=14; x.stroke(); }
 
-  // pickups
+  // pickups (telemetry glows hotter than battlefield debris so it reads as collectible)
+  x.globalCompositeOperation='lighter';
+  for(const k of g.pickups){ if(k.kind!=='xp')continue;
+    const gl=glow(10); x.globalAlpha=.6;
+    x.drawImage(gl,k.x-gl.width/2,k.y-gl.height/2); }
+  x.globalCompositeOperation='source-over'; x.globalAlpha=1;
   for(const k of g.pickups){
-    if(k.kind==='xp'){ x.fillStyle='rgba(230,238,226,.9)';
+    if(k.kind==='xp'){ x.fillStyle='rgba(248,252,246,1)';
       x.save(); x.translate(k.x,k.y); x.rotate(Math.PI/4);
       x.fillRect(-3,-3,6,6); x.restore();
     } else { x.strokeStyle='rgba(255,255,255,.95)'; x.lineWidth=2.4;
@@ -2086,11 +2105,11 @@ function blit(){
 // ---------- HUD: MTS-B symbology (polarity-aware ink) ----------
 function hudInk(a){ return Game.polarity==='BLK' ? `rgba(22,30,22,${a})` : `rgba(226,238,222,${a})`; }
 function hudBg(a){ return Game.polarity==='BLK' ? `rgba(255,255,255,${a})` : `rgba(0,0,0,${a})`; }
-function hudAlert(a){ return Game.polarity==='BLK' ? `rgba(110,58,8,${a})` : `rgba(255,226,196,${a})`; }
-function hudText(t,xp,yp,size=11,al='left',dim=false){
+function hudAlert(a){ return Game.polarity==='BLK' ? `rgba(124,58,6,${a})` : `rgba(255,201,120,${a})`; }
+function hudText(t,xp,yp,size=11,al='left',dim=false,alert=false){
   ctx.font=`${size}px ui-monospace, Menlo, Consolas, monospace`;
   ctx.textAlign=al; ctx.textBaseline='top';
-  ctx.fillStyle=hudInk(dim?.55:.92);
+  ctx.fillStyle=alert?hudAlert(dim?.7:.95):hudInk(dim?.55:.92);
   ctx.fillText(t,xp,yp);
 }
 function drawHUD(){
@@ -2117,6 +2136,15 @@ function drawHUD(){
   hudText('TRK 0042', sx+bs+6, sy-bs, 10);
   hudText('UAP // ANOM', sx+bs+6, sy-bs+12, 10, 'left', true);
 
+  // hull + power strapped under the track box, where the eye lives
+  const tbw=bs*2, tby=sy+bs+7;
+  ctx.fillStyle=hudBg(.45); ctx.fillRect(sx-bs, tby, tbw, 4);
+  ctx.fillStyle= p.hp<p.maxHp*.25 && Math.floor(performance.now()/300)%2===0
+      ? hudAlert(.95) : hudInk(.9);
+  ctx.fillRect(sx-bs, tby, tbw*clamp(p.hp/p.maxHp,0,1), 4);
+  ctx.fillStyle=hudBg(.45); ctx.fillRect(sx-bs, tby+6, tbw, 2.5);
+  ctx.fillStyle=hudInk(.6); ctx.fillRect(sx-bs, tby+6, tbw*clamp(p.energy/100,0,1), 2.5);
+
   // boss / elite designators + heavy unit tags
   for(const e of g.enemies){ if(!(e.boss||e.elite||e.tag))continue;
     const ex=cx+(e.x-g.cam.x-g.cam.jx)*g.cam.ez, ey=cy+(e.y-g.cam.y-g.cam.jy)*g.cam.ez;
@@ -2141,23 +2169,37 @@ function drawHUD(){
     }
   }
 
+  // hull restores are rare — the sensor flags them in alert ink (drawn post-filter so color survives)
+  for(const k of g.pickups){ if(k.kind!=='hp') continue;
+    const kx=cx+(k.x-g.cam.x-g.cam.jx)*g.cam.ez, ky=cy+(k.y-g.cam.y-g.cam.jy)*g.cam.ez;
+    if(kx<14||kx>W-14||ky<14||ky>H-14) continue;
+    const pu=.55+.45*Math.sin(performance.now()*.007);
+    ctx.strokeStyle=hudAlert(pu); ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(kx-7,ky); ctx.lineTo(kx+7,ky);
+    ctx.moveTo(kx,ky-7); ctx.lineTo(kx,ky+7); ctx.stroke();
+    ctx.strokeStyle=hudAlert(pu*.5); ctx.lineWidth=1.2;
+    ctx.strokeRect(kx-12,ky-12,24,24);
+  }
+
   // tasking waypoint: on-screen diamond or edge marker, with slant range
   const wpt=g.getWpt();
   if(wpt){
     const wx=cx+(wpt.x-g.cam.x-g.cam.jx)*g.cam.ez, wy=cy+(wpt.y-g.cam.y-g.cam.jy)*g.cam.ez;
     const dM=Math.round(Math.hypot(wpt.x-p.x,wpt.y-p.y));
+    // objective markers carry alert ink: amber means act on this
+    const wpu=.7+.3*Math.sin(performance.now()*.005);
     if(wx>26&&wx<W-26&&wy>40&&wy<H-40){
-      ctx.strokeStyle=hudInk(.9); ctx.lineWidth=1.4;
+      ctx.strokeStyle=hudAlert(wpu); ctx.lineWidth=1.6;
       ctx.save(); ctx.translate(wx,wy); ctx.rotate(Math.PI/4);
       ctx.strokeRect(-9,-9,18,18); ctx.restore();
-      hudText(wpt.lbl+' '+dM+'M', wx+14, wy-16, 9);
+      hudText(wpt.lbl+' '+dM+'M', wx+14, wy-16, 9, 'left', false, true);
     } else {
       const a=Math.atan2(wy-cy,wx-cx);
       const rx=cx+Math.cos(a)*(Math.min(W,H)/2-64), ry=cy+Math.sin(a)*(Math.min(W,H)/2-64);
       ctx.save(); ctx.translate(rx,ry); ctx.rotate(a+Math.PI/4);
-      ctx.strokeStyle=hudInk(.9); ctx.lineWidth=1.4; ctx.strokeRect(-7,-7,14,14);
+      ctx.strokeStyle=hudAlert(wpu); ctx.lineWidth=1.6; ctx.strokeRect(-7,-7,14,14);
       ctx.restore();
-      hudText(wpt.lbl+' '+dM+'M', rx-Math.cos(a)*40, ry-Math.sin(a)*40-4, 9, 'center', true);
+      hudText(wpt.lbl+' '+dM+'M', rx-Math.cos(a)*40, ry-Math.sin(a)*40-4, 9, 'center', false, true);
     }
   }
 
