@@ -206,6 +206,8 @@
     </div>
   </div>
 </div>
+<!-- optional pre-generated voice-over (tools/generate-voices.mjs writes window.VOICES). Stub ships empty. -->
+<script src="voices.js"></script>
 <script>
 // fault visibility: never fail to a silent black screen
 addEventListener('error',e=>{
@@ -265,36 +267,154 @@ const ang=(ax,ay,bx,by)=>Math.atan2(by-ay,bx-ax);
 function mulberry(seed){return function(){seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
 const fmtTime=s=>{s=Math.floor(s);return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
 
-// ---------- audio (synth, no assets) ----------
+// ---------- audio (synth, no assets) — reverb bus + evolving eerie bed ----------
 const AudioSys = {
   ctx:null, master:null, muted:false, humOn:false, lowHullTimer:0,
+  dryIn:null, wetBus:null, verbReturn:null, pad:null,
   init(){ if(this.ctx) return;
     try{
-      this.ctx = new (window.AudioContext||window.webkitAudioContext)();
-      this.master = this.ctx.createGain(); this.master.gain.value=.5;
-      this.master.connect(this.ctx.destination);
-      // ambient hum: filtered noise + low sine, very quiet
-      const len=this.ctx.sampleRate*2, buf=this.ctx.createBuffer(1,len,this.ctx.sampleRate);
-      const d=buf.getChannelData(0); let v=0;
-      for(let i=0;i<len;i++){ v=v*.98+ (Math.random()*2-1)*.02; d[i]=v*3; }
-      const src=this.ctx.createBufferSource(); src.buffer=buf; src.loop=true;
-      const lp=this.ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=240;
-      const g=this.ctx.createGain(); g.gain.value=.14;
-      src.connect(lp).connect(g).connect(this.master); src.start();
-      const o=this.ctx.createOscillator(); o.frequency.value=52; o.type='sine';
-      const og=this.ctx.createGain(); og.gain.value=.045; o.connect(og).connect(this.master); o.start();
+      const ac=this.ctx=new (window.AudioContext||window.webkitAudioContext)();
+      this.master=ac.createGain(); this.master.gain.value=.5; this.master.connect(ac.destination);
+      // reverb send bus: every source can split dry (→master) + wet (→convolver→master)
+      this.dryIn=ac.createGain(); this.dryIn.connect(this.master);
+      this.wetBus=ac.createGain();
+      const damp=ac.createBiquadFilter(); damp.type='lowpass'; damp.frequency.value=2600; // dark tail
+      const verb=ac.createConvolver(); verb.buffer=this._makeIR(MOBILE?1.8:2.8);
+      this.verbReturn=ac.createGain(); this.verbReturn.gain.value=.85;
+      this.wetBus.connect(damp).connect(verb).connect(this.verbReturn).connect(this.master);
+      this._buildPad();
+      this.setEra(0);
     }catch(e){}
   },
-  tone(f0,f1,dur,type='square',vol=.12,delay=0){
+  // procedurally-synthesised impulse response: decaying noise, no asset
+  _makeIR(sec){ const ac=this.ctx, len=Math.max(1,Math.floor(ac.sampleRate*sec));
+    const ir=ac.createBuffer(2,len,ac.sampleRate);
+    for(let ch=0;ch<2;ch++){ const d=ir.getChannelData(ch);
+      for(let i=0;i<len;i++){ const e=Math.pow(1-i/len,2.6); d[i]=(Math.random()*2-1)*e; } }
+    return ir;
+  },
+  // wire a source's output to the dry bus, and (optionally) a scaled send to the wet bus
+  _route(node,send=0){ if(!this.dryIn){ node.connect(this.master); return; }
+    node.connect(this.dryIn);
+    if(send>0){ const s=this.ctx.createGain(); s.gain.value=send; node.connect(s).connect(this.wetBus); }
+  },
+  // continuous eerie pad: low dissonant drone, independent slow LFOs → drifting, never loops
+  _buildPad(){ const ac=this.ctx;
+    const filt=ac.createBiquadFilter(); filt.type='lowpass'; filt.frequency.value=600; filt.Q.value=.7;
+    const out=ac.createGain(); out.gain.value=1; filt.connect(out); this._route(out,.55);
+    const flfo=ac.createOscillator(); flfo.type='sine'; flfo.frequency.value=.025;
+    const fg=ac.createGain(); fg.gain.value=170; flfo.connect(fg).connect(filt.frequency); flfo.start();
+    this.pad={filt, out, voices:[], hiss:null};
+    const defs=[ {type:'sine',     base:46,   gain:.10,  lfo:.06},   // sub drone — unease
+                 {type:'sine',     base:92,   gain:.05,  lfo:.09},   // octave (thinned in early eras)
+                 {type:'triangle', base:65,   gain:.045, lfo:.07},   // tritone — the "wrong" tension
+                 {type:'sine',     base:1600, gain:.012, lfo:.13} ]; // frail high partial — the eerie shimmer
+    for(const D of defs){
+      const o=ac.createOscillator(); o.type=D.type; o.frequency.value=D.base;
+      const g=ac.createGain(); g.gain.value=D.gain;
+      const lfo=ac.createOscillator(); lfo.type='sine'; lfo.frequency.value=D.lfo;
+      const lg=ac.createGain(); lg.gain.value=D.gain*.55; lfo.connect(lg).connect(g.gain);
+      const dlfo=ac.createOscillator(); dlfo.type='sine'; dlfo.frequency.value=D.lfo*.5;
+      const dg=ac.createGain(); dg.gain.value=6; dlfo.connect(dg).connect(o.detune); // cents of beating
+      o.connect(g).connect(filt); o.start(); lfo.start(); dlfo.start();
+      this.pad.voices.push({o,g,base:D.base,gain:D.gain});
+    }
+    // hiss bed, scaled by era
+    const hl=Math.floor(ac.sampleRate*2), hb=ac.createBuffer(1,hl,ac.sampleRate), hd=hb.getChannelData(0);
+    for(let i=0;i<hl;i++) hd[i]=(Math.random()*2-1)*.5;
+    const hs=ac.createBufferSource(); hs.buffer=hb; hs.loop=true;
+    const hf=ac.createBiquadFilter(); hf.type='bandpass'; hf.frequency.value=1800; hf.Q.value=.5;
+    const hg=ac.createGain(); hg.gain.value=.02; hs.connect(hf).connect(hg); this._route(hg,.4); hs.start();
+    this.pad.hiss=hg;
+  },
+  // era-reactive mood: 1908 haunted/sparse → modern cosmic dread. Ramped, not snapped.
+  setEra(eraI){ if(!this.ctx||!this.pad) return;
+    const ac=this.ctx, now=ac.currentTime, R=.9;
+    const grp=(typeof ERAS!=='undefined'&&ERAS[eraI])?ERAS[eraI].grp:0;
+    const prof = grp<=1 ? {trans:.94, cut:480, hiss:.030, wet:1.0,  octave:.20}  // haunted, sparse, cavernous
+               : grp===2? {trans:1.0,  cut:620, hiss:.018, wet:.85, octave:1.0}  // fuller, tense
+               :          {trans:1.06, cut:820, hiss:.012, wet:.8,  octave:1.0}; // colder, cosmic
+    for(const v of this.pad.voices) v.o.frequency.setTargetAtTime(v.base*prof.trans, now, R);
+    const oct=this.pad.voices[1]; oct.g.gain.setTargetAtTime(oct.gain*prof.octave, now, R);
+    this.pad.filt.frequency.setTargetAtTime(prof.cut, now, R);
+    this.pad.hiss.gain.setTargetAtTime(prof.hiss, now, R);
+    this.verbReturn.gain.setTargetAtTime(.85*prof.wet, now, R);
+  },
+  // radio "changing station" sweep on era slip: dial whoosh + carrier blips + static, pad ducks
+  tune(){ if(!this.ctx||this.muted) return; const ac=this.ctx, t=ac.currentTime, dur=1.2;
+    if(this.pad){ const pg=this.pad.out.gain; pg.cancelScheduledValues(t);
+      pg.setValueAtTime(pg.value,t); pg.linearRampToValueAtTime(.15,t+.06); pg.linearRampToValueAtTime(1,t+1.5); }
+    const n=Math.floor(ac.sampleRate*dur), buf=ac.createBuffer(1,n,ac.sampleRate), d=buf.getChannelData(0);
+    for(let i=0;i<n;i++) d[i]=Math.random()*2-1;
+    const src=ac.createBufferSource(); src.buffer=buf;
+    const bp=ac.createBiquadFilter(); bp.type='bandpass'; bp.Q.value=6;
+    bp.frequency.setValueAtTime(200,t); bp.frequency.exponentialRampToValueAtTime(4000,t+dur);
+    const g=ac.createGain(); g.gain.setValueAtTime(.0001,t);
+    g.gain.linearRampToValueAtTime(.16,t+.1); g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+    src.connect(bp).connect(g); this._route(g,.5); src.start(t); src.stop(t+dur+.02);
+    for(let k=0;k<3;k++){ const cf=300+((k*977)%2400); this.tone(cf,cf,.08,'square',.05,.2+k*.32,.3); } // stations bleeding through
+    this.noise(.5,.05,3000,.4,.3); // static crackle
+  },
+  // THE SIGNAL announces itself: a reverberant low minor cluster with a high tritone shimmer
+  signalCue(){ const b=130;
+    this.tone(b,      b,      1.4,'sine',.05,0,  .6);   // root
+    this.tone(b*1.189,b*1.189,1.4,'sine',.035,.05,.6);  // minor third
+    this.tone(b*1.498,b*1.498,1.4,'sine',.03,.1, .6);   // fifth
+    this.tone(b*2.06, b*2.06, 1.6,'sine',.02,0,  .65);  // high tritone — dread
+  },
+  // shared contract with tools/generate-voices.mjs: {speaker,text} -> stable clip id.
+  // MUST stay byte-identical to the generator or lookups miss. djb2 over "spk|txt".
+  voiceKey(spk,txt){ const s=spk+'|'+txt; let h=5381;
+    for(let i=0;i<s.length;i++) h=((h<<5)+h+s.charCodeAt(i))|0; return (h>>>0).toString(36); },
+  // play a pre-generated VO clip (window.VOICES[key] = data-URI). Returns false if absent
+  // so Comms can fall back to the synth cue. SIGNAL gets the ethereal chain; mil gets radio.
+  playVoice(key,ethereal){
+    if(!this.ctx||this.muted) return false;
+    const src=(typeof window!=='undefined'&&window.VOICES)?window.VOICES[key]:null;
+    if(!src) return false;
+    const ac=this.ctx, cache=this._vcache||(this._vcache={});
+    const spin=buf=>{
+      if(ethereal){
+        // the SIGNAL is never "in the room": a detuned unison chorus + a sub-octave ghost,
+        // wavering tremolo, drowned in reverb. Layers built via mk(detuneCents, playbackRate).
+        const mk=(det,rate)=>{ const s=ac.createBufferSource(); s.buffer=buf;
+          if(rate) s.playbackRate.value=rate; try{ s.detune.value=det; }catch(_){} return s; };
+        const core=mk(-6);                       // body, slightly flat → unnaturally low
+        const trem=ac.createGain(); trem.gain.value=.9;
+        const lfo=ac.createOscillator(); lfo.type='sine'; lfo.frequency.value=4.0;
+        const lg=ac.createGain(); lg.gain.value=.16; lfo.connect(lg).connect(trem.gain); lfo.start();
+        core.connect(trem); this._route(trem,.85);
+        const dA=mk(-18), gA=ac.createGain(); gA.gain.value=.40; dA.connect(gA); this._route(gA,.85); // chorus −
+        const dB=mk(12),  gB=ac.createGain(); gB.gain.value=.30; dB.connect(gB); this._route(gB,.85); // chorus +
+        const sub=mk(0,0.5), gS=ac.createGain(); gS.gain.value=.16; // sub-octave ghost, half-speed undertone
+        const slp=ac.createBiquadFilter(); slp.type='lowpass'; slp.frequency.value=700;
+        sub.connect(slp).connect(gS); this._route(gS,.9);
+        core.start(); dA.start(); dB.start(); sub.start();
+        core.onended=()=>{ try{lfo.stop();}catch(_){} };
+      } else {
+        // military: bandpass "radio intercept" + light room
+        const s=ac.createBufferSource(); s.buffer=buf;
+        const hp=ac.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=420;
+        const bp=ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1700; bp.Q.value=.9;
+        const g=ac.createGain(); g.gain.value=1;
+        s.connect(hp).connect(bp).connect(g); this._route(g,.15); s.start();
+      }
+    };
+    if(cache[key]){ spin(cache[key]); return true; }
+    fetch(src).then(r=>r.arrayBuffer()).then(b=>ac.decodeAudioData(b))
+      .then(buf=>{ cache[key]=buf; spin(buf); }).catch(()=>{});
+    return true;
+  },
+  tone(f0,f1,dur,type='square',vol=.12,delay=0,send=0){
     if(!this.ctx||this.muted)return;
     try{
       const t=this.ctx.currentTime+delay, o=this.ctx.createOscillator(), g=this.ctx.createGain();
       o.type=type; o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(Math.max(1,f1),t+dur);
       g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.0001,t+dur);
-      o.connect(g).connect(this.master); o.start(t); o.stop(t+dur+.02);
+      o.connect(g); this._route(g,send); o.start(t); o.stop(t+dur+.02);
     }catch(e){}
   },
-  noise(dur,vol=.2,freq=900,q=.6){
+  noise(dur,vol=.2,freq=900,q=.6,send=0){
     if(!this.ctx||this.muted)return;
     try{
       const t=this.ctx.currentTime, n=Math.floor(this.ctx.sampleRate*dur);
@@ -303,20 +423,22 @@ const AudioSys = {
       const src=this.ctx.createBufferSource(); src.buffer=buf;
       const f=this.ctx.createBiquadFilter(); f.type='bandpass'; f.frequency.value=freq; f.Q.value=q;
       const g=this.ctx.createGain(); g.gain.value=vol;
-      src.connect(f).connect(g).connect(this.master); src.start(t);
+      src.connect(f).connect(g); this._route(g,send); src.start(t);
     }catch(e){}
   },
+  // combat stays DRY (send 0) — clarity is sacred in a bullet-hell
   shoot(){ this.tone(820,260,.06,'square',.05); },
   zap(){ this.tone(1400,200,.09,'sawtooth',.06); },
   hit(){ const n=performance.now(); if(n-(this._lastHit||0)<45)return; this._lastHit=n; this.noise(.05,.10,1400,1); },
   hurt(){ this.noise(.18,.25,420,.8); this.tone(180,70,.2,'sawtooth',.12); },
   boom(big=false){ this.noise(big?.5:.28,big?.4:.26,big?220:380,.5); this.tone(big?120:170,40,big?.5:.3,'sine',.2); },
-  pickup(){ this.tone(620,980,.07,'sine',.08); },
-  level(){ this.tone(520,780,.12,'sine',.12); this.tone(780,1180,.16,'sine',.1,.1); },
   dash(){ this.noise(.16,.18,2200,.4); },
-  alarm(){ this.tone(960,960,.1,'square',.09); this.tone(960,960,.1,'square',.09,.18); },
-  lock(){ for(let i=0;i<4;i++) this.tone(1180,1180,.05,'square',.07,i*.13); },
-  phase(){ this.tone(300,520,.3,'triangle',.1); this.tone(450,760,.34,'triangle',.08,.12); },
+  // rewards & systems get shimmer (wet send)
+  pickup(){ this.tone(620,980,.07,'sine',.08,0,.3); },
+  level(){ this.tone(520,780,.12,'sine',.12,0,.3); this.tone(780,1180,.16,'sine',.1,.1,.3); },
+  alarm(){ this.tone(960,960,.1,'square',.09,0,.1); this.tone(960,960,.1,'square',.09,.18,.1); },
+  lock(){ for(let i=0;i<4;i++) this.tone(1180,1180,.05,'square',.07,i*.13,.25); },
+  phase(){ this.tone(300,520,.3,'triangle',.1,0,.3); this.tone(450,760,.34,'triangle',.08,.12,.3); },
 };
 
 // ---------- comms: intercepted radio + THE SIGNAL ----------
@@ -327,8 +449,11 @@ const Comms = {
   clear(){ this.queue.length=0; this.live.length=0; this.pend=null; },
   push(n){ this.live.push({spk:n.spk,txt:n.txt,tone:n.tone,shown:0,t:8,_pc:0});
     if(this.live.length>3) this.live.shift();
-    if(n.tone==='sig') AudioSys.tone(170,520,.5,'sine',.05);
-    else { AudioSys.tone(1300,1300,.025,'square',.035); AudioSys.tone(1250,1250,.02,'square',.03,.08); } },
+    const played = AudioSys.playVoice(AudioSys.voiceKey(n.spk,n.txt), n.tone==='sig');
+    if(!played){ // no VO clip for this line → synth cue
+      if(n.tone==='sig') AudioSys.signalCue();
+      else { AudioSys.tone(1300,1300,.025,'square',.035,0,.12); AudioSys.tone(1250,1250,.02,'square',.03,.08,.12); }
+    } },
   update(dt){
     for(let i=this.live.length-1;i>=0;i--){ const l=this.live[i];
       if(l.shown<l.txt.length){ l.shown=Math.min(l.txt.length,l.shown+dt*48);
@@ -807,6 +932,7 @@ const Game = {
       this.ckpt=null;
       this.showBanner(PHASES[0].name, PHASES[0].sub); AudioSys.phase();
     }
+    AudioSys.setEra(this.eraI||0); // bed matches the era we're entering (esp. on resume)
     document.getElementById('menu').classList.add('hidden');
     document.getElementById('death').classList.add('hidden');
   },
@@ -916,7 +1042,8 @@ const Game = {
     this.eraI=Math.min(i,ERAS.length-1);
     const pb=document.getElementById('polBtn');
     if(pb) pb.style.opacity = ERAS[this.eraI].grp>=3 ? '' : '.25';
-    if(slipped){ this.glitch=Math.max(this.glitch,.85); this.flashW=Math.max(this.flashW,.25); AudioSys.phase(); }
+    if(slipped){ this.glitch=Math.max(this.glitch,.85); this.flashW=Math.max(this.flashW,.25); AudioSys.tune(); }
+    AudioSys.setEra(this.eraI); // shift the bed's mood to this decade (slip or not)
     if(d.comms) Comms.sayAll(d.comms);
     const E=ERAS[this.eraI];
     this.showBanner(String(E.y)+' \u2014 '+E.name, 'TASKING '+(i+1)+': '+d.desc); AudioSys.lock();
@@ -1892,20 +2019,13 @@ function render(dtNow){
     x.beginPath(); x.arc(r.x,r.y,r.r,0,TAU); x.stroke();
     x.strokeStyle='rgba(245,248,240,.25)'; x.lineWidth=14; x.stroke(); }
 
-  // pickups (telemetry glows hotter than battlefield debris so it reads as collectible)
+  // pickups: heat signature only in the feed — the crisp coloured marker is on the HUD
+  // (post-filter), since the world layer is greyscaled and would wash any colour to grey
   x.globalCompositeOperation='lighter';
-  for(const k of g.pickups){ if(k.kind!=='xp')continue;
-    const gl=glow(10); x.globalAlpha=.6;
+  for(const k of g.pickups){
+    const gl=glow(k.kind==='hp'?16:10); x.globalAlpha=k.kind==='hp'?.55:.6;
     x.drawImage(gl,k.x-gl.width/2,k.y-gl.height/2); }
   x.globalCompositeOperation='source-over'; x.globalAlpha=1;
-  for(const k of g.pickups){
-    if(k.kind==='xp'){ x.fillStyle='rgba(248,252,246,1)';
-      x.save(); x.translate(k.x,k.y); x.rotate(Math.PI/4);
-      x.fillRect(-3,-3,6,6); x.restore();
-    } else { x.strokeStyle='rgba(255,255,255,.95)'; x.lineWidth=2.4;
-      x.beginPath(); x.moveTo(k.x-7,k.y); x.lineTo(k.x+7,k.y);
-      x.moveTo(k.x,k.y-7); x.lineTo(k.x,k.y+7); x.stroke(); }
-  }
 
   // tasking objects: fragments, beacon zone, extraction window
   for(const f of g.frags){ const pu=.6+.4*Math.sin(f.puls*5);
@@ -2106,6 +2226,7 @@ function blit(){
 function hudInk(a){ return Game.polarity==='BLK' ? `rgba(22,30,22,${a})` : `rgba(226,238,222,${a})`; }
 function hudBg(a){ return Game.polarity==='BLK' ? `rgba(255,255,255,${a})` : `rgba(0,0,0,${a})`; }
 function hudAlert(a){ return Game.polarity==='BLK' ? `rgba(124,58,6,${a})` : `rgba(255,201,120,${a})`; }
+function hudPick(a){ return Game.polarity==='BLK' ? `rgba(14,92,32,${a})` : `rgba(120,242,150,${a})`; }
 function hudText(t,xp,yp,size=11,al='left',dim=false,alert=false){
   ctx.font=`${size}px ui-monospace, Menlo, Consolas, monospace`;
   ctx.textAlign=al; ctx.textBaseline='top';
@@ -2169,16 +2290,25 @@ function drawHUD(){
     }
   }
 
-  // hull restores are rare — the sensor flags them in alert ink (drawn post-filter so color survives)
-  for(const k of g.pickups){ if(k.kind!=='hp') continue;
+  // collectibles flagged in colour on the HUD — the feed is greyscale, so colour only
+  // survives here (post-filter). Two tiers: telemetry = phosphor green, hull = amber.
+  const ppu=.55+.45*Math.sin(performance.now()*.007);
+  for(const k of g.pickups){
     const kx=cx+(k.x-g.cam.x-g.cam.jx)*g.cam.ez, ky=cy+(k.y-g.cam.y-g.cam.jy)*g.cam.ez;
-    if(kx<14||kx>W-14||ky<14||ky>H-14) continue;
-    const pu=.55+.45*Math.sin(performance.now()*.007);
-    ctx.strokeStyle=hudAlert(pu); ctx.lineWidth=2;
-    ctx.beginPath(); ctx.moveTo(kx-7,ky); ctx.lineTo(kx+7,ky);
-    ctx.moveTo(kx,ky-7); ctx.lineTo(kx,ky+7); ctx.stroke();
-    ctx.strokeStyle=hudAlert(pu*.5); ctx.lineWidth=1.2;
-    ctx.strokeRect(kx-12,ky-12,24,24);
+    if(kx<12||kx>W-12||ky<12||ky>H-12) continue;
+    if(k.kind==='hp'){ // rare hull restore: pulsing amber cross + designator box
+      ctx.strokeStyle=hudAlert(ppu); ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(kx-7,ky); ctx.lineTo(kx+7,ky);
+      ctx.moveTo(kx,ky-7); ctx.lineTo(kx,ky+7); ctx.stroke();
+      ctx.strokeStyle=hudAlert(ppu*.5); ctx.lineWidth=1.2;
+      ctx.strokeRect(kx-12,ky-12,24,24);
+    } else { // telemetry: small green diamond with a soft halo
+      ctx.fillStyle=hudPick(.35);
+      ctx.beginPath(); ctx.arc(kx,ky,7,0,TAU); ctx.fill();
+      ctx.fillStyle=hudPick(.95);
+      ctx.save(); ctx.translate(kx,ky); ctx.rotate(Math.PI/4);
+      ctx.fillRect(-3.4,-3.4,6.8,6.8); ctx.restore();
+    }
   }
 
   // tasking waypoint: on-screen diamond or edge marker, with slant range
