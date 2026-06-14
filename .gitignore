@@ -1,0 +1,8 @@
+# secrets — never commit
+.env
+.env.*
+
+# local test / tooling artifacts
+.playwright-mcp/
+*.tmp
+tools/.voice-cache.json
